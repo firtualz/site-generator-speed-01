@@ -22,20 +22,12 @@ ENT[34] = '&quot;';
 ENT[39] = '&#39;';
 
 /** `text` with & < > " and ' escaped. Returns the input untouched when it holds none of them. */
+const ESC_TEST = /[&<>"']/;
+const ESC_RE = /[&<>"']/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 export function escapeHtml(text) {
-  let out = null;
-  let start = 0;
-  for (let i = 0; i < text.length; i++) {
-    const e = ENT[text.charCodeAt(i)];
-    if (e !== undefined) {
-      if (out === null) out = text.slice(0, i);
-      else out += text.slice(start, i);
-      out += e;
-      start = i + 1;
-    }
-  }
-  if (out === null) return text;
-  return out + text.slice(start);
+  if (!ESC_TEST.test(text)) return text;
+  return text.replace(ESC_RE, (c) => ESC_MAP[c]);
 }
 
 /** Whether char code `c` is JS whitespace (\s). */
@@ -53,10 +45,9 @@ function wordsOf(text) {
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    // JS \s, inlined (measured faster than a helper call or /\S+/g).
-    const ws =
-      c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12 || c === 160 || c === 0x1680 ||
-      (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+    // ASCII whitespace is all <= 32; only a code above 127 can be one of the
+    // other JS \s characters, so the common case is one comparison.
+    const ws = c <= 32 || (c > 127 && isWSCode(c));
     if (ws) inWord = false;
     else if (!inWord) {
       inWord = true;
@@ -261,12 +252,23 @@ export function parseFrontMatter(text) {
 const ESC = new Uint8Array(128);
 for (const c of [92, 96, 42, 95, 91, 93, 40, 41, 35, 43, 45, 46, 33, 62]) ESC[c] = 1;
 
+/** Char codes that stop a plain run in inline(): one table lookup replaces nine comparisons. Codes above 127 read as undefined (falsy), and no special is above 127. */
+const SP = new Uint8Array(128);
+for (const c of [92, 96, 42, 91, 38, 60, 62, 34, 39]) SP[c] = 1;
+
 function isEscapable(code) {
   return code < 128 && ESC[code] === 1;
 }
 
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
+  // Fast path: indexOf finds the first candidate; when no backslash precedes
+  // it in [from, k), nothing could escape it, so it is the answer.
+  const k = s.indexOf(what, from);
+  if (k === -1) return -1;
+  const bs = s.indexOf('\\', from);
+  if (bs === -1 || bs > k) return k;
+  // Slow path: a backslash precedes the candidate; scan carefully.
   const wlen = what.length;
   for (let j = from; j <= s.length - wlen; j++) {
     if (s.charCodeAt(j) === 92 && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
@@ -280,18 +282,33 @@ function findUnescaped(s, what, from) {
 
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
-      j++;
-      continue;
+  // Fast path: indexOf finds the next star; a star with no backslash before
+  // it in [from, k) is genuine — return it unless it opens a `**` pair, in
+  // which case continue after the pair. A backslash before a star falls back
+  // to the careful scan (pairs skipped before it held no backslash, so the
+  // careful scan from the advanced `from` answers the same).
+  const bs = s.indexOf('\\', from);
+  let k = s.indexOf('*', from);
+  while (k !== -1) {
+    if (bs !== -1 && bs < k) {
+      for (let j = from; j < s.length; j++) {
+        const c = s.charCodeAt(j);
+        if (c === 92 && j + 1 < s.length && isEscapable(s.charCodeAt(j + 1))) {
+          j++;
+          continue;
+        }
+        if (c !== 42) continue;
+        if (s.charCodeAt(j + 1) === 42) {
+          j++;
+          continue;
+        }
+        return j;
+      }
+      return -1;
     }
-    if (c !== 42) continue;
-    if (s.charCodeAt(j + 1) === 42) {
-      j++;
-      continue;
-    }
-    return j;
+    if (s.charCodeAt(k + 1) !== 42) return k;
+    from = k + 2;
+    k = s.indexOf('*', from);
   }
   return -1;
 }
@@ -310,11 +327,7 @@ function inline(s, linkFn) {
   const n = s.length;
   while (i < n) {
     let j = i;
-    while (j < n) {
-      const c = s.charCodeAt(j);
-      if (c === 92 || c === 96 || c === 42 || c === 91 || c === 38 || c === 60 || c === 62 || c === 34 || c === 39) break;
-      j++;
-    }
+    while (j < n && !SP[s.charCodeAt(j)]) j++;
     if (j > i) out += s.slice(i, j);
     if (j >= n) break;
     const c = s.charCodeAt(j);
@@ -452,11 +465,6 @@ function hrAt(src, ls, le) {
   return lineRestBlank(src, ls + 3, le);
 }
 
-/** Whether the line ends a paragraph: blank, fence, heading or thematic break. */
-function endsParagraph(src, ls, le) {
-  return lineBlank(src, ls, le) || fenceOpen(src, ls, le) !== null || headingAt(src, ls, le) !== null || hrAt(src, ls, le);
-}
-
 /** A line trimmed of spaces and tabs at both ends. */
 function trimLine(src, ls, le) {
   let a = ls;
@@ -514,11 +522,19 @@ export function renderMarkdown(src, linkFn, slugCache) {
     const nl = src.indexOf('\n', i);
     const le = nl === -1 ? n : nl;
     const next = nl === -1 ? n : nl + 1;
-    if (lineBlank(src, i, le)) {
+    if (i === le) {
       i = next;
       continue;
     }
-    const lang = fenceOpen(src, i, le);
+    // One first-character dispatch: a line can only be the block its first
+    // character allows, so the six per-line checks below run only on lines
+    // that could pass them (a plain text line skips all of them).
+    const c0 = src.charCodeAt(i);
+    if ((c0 === 32 || c0 === 9) && lineBlank(src, i, le)) {
+      i = next;
+      continue;
+    }
+    const lang = c0 === 96 ? fenceOpen(src, i, le) : null;
     if (lang !== null) {
       let body = '';
       let closed = false;
@@ -541,7 +557,7 @@ export function renderMarkdown(src, linkFn, slugCache) {
       out += '<pre><code' + (lang === '' ? '' : ' class="language-' + escapeHtml(lang) + '"') + '>' + body + '</code></pre>\n';
       continue;
     }
-    const h = headingAt(src, i, le);
+    const h = c0 === 35 ? headingAt(src, i, le) : null;
     if (h !== null) {
       const text = src.slice(h.ts, h.te);
       const id = uniqueSlug(slugify(text, slugCache), ids);
@@ -551,12 +567,12 @@ export function renderMarkdown(src, linkFn, slugCache) {
       i = next;
       continue;
     }
-    if (hrAt(src, i, le)) {
+    if ((c0 === 45 || c0 === 42) && hrAt(src, i, le)) {
       out += '<hr>\n';
       i = next;
       continue;
     }
-    if (src.charCodeAt(i) === 62) {
+    if (c0 === 62) {
       // Blockquote: lines opening on '>'.
       const lines = [];
       while (i < n && src.charCodeAt(i) === 62) {
@@ -572,8 +588,8 @@ export function renderMarkdown(src, linkFn, slugCache) {
       out += lines.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(lines.join('\n'), linkFn)}</p>\n</blockquote>\n`;
       continue;
     }
-    const bRest = bulletAt(src, i, le);
-    const oMark = bRest === -1 ? orderedAt(src, i, le) : null;
+    const bRest = (c0 === 45 || c0 === 42) ? bulletAt(src, i, le) : -1;
+    const oMark = bRest === -1 && c0 >= 48 && c0 <= 57 ? orderedAt(src, i, le) : null;
     if (bRest !== -1 || oMark !== null) {
       const isOrdered = oMark !== null;
       const start = isOrdered ? oMark.start : 1;
@@ -584,8 +600,9 @@ export function renderMarkdown(src, linkFn, slugCache) {
         const le2 = nl2 === -1 ? n : nl2;
         const next2 = nl2 === -1 ? n : nl2 + 1;
         let rest = -1;
-        if (!isOrdered) rest = bulletAt(src, i, le2);
-        else {
+        const d0 = i === le2 ? -1 : src.charCodeAt(i);
+        if (!isOrdered && (d0 === 45 || d0 === 42)) rest = bulletAt(src, i, le2);
+        else if (isOrdered && d0 >= 48 && d0 <= 57) {
           const om = orderedAt(src, i, le2);
           rest = om === null ? -1 : om.rest;
         }
@@ -606,13 +623,20 @@ export function renderMarkdown(src, linkFn, slugCache) {
       continue;
     }
     // Paragraph: lines up to a blank line, a fence, a heading or a break.
+    // Same first-character dispatch as the main loop: only a line whose
+    // first character allows it is tested for ending the paragraph.
     const parts = [trimLine(src, i, le)];
     i = next;
     while (i < n) {
       const nl2 = src.indexOf('\n', i);
       const le2 = nl2 === -1 ? n : nl2;
       const next2 = nl2 === -1 ? n : nl2 + 1;
-      if (endsParagraph(src, i, le2)) break;
+      if (i === le2) break;
+      const d0 = src.charCodeAt(i);
+      if (d0 === 32 || d0 === 9) { if (lineBlank(src, i, le2)) break; }
+      else if (d0 === 96) { if (fenceOpen(src, i, le2) !== null) break; }
+      else if (d0 === 35) { if (headingAt(src, i, le2) !== null) break; }
+      else if (d0 === 45 || d0 === 42) { if (hrAt(src, i, le2)) break; }
       parts.push(trimLine(src, i, le2));
       i = next2;
     }
@@ -785,12 +809,14 @@ function compileNodes(nodes) {
     }
   };
   // Emit a path lookup into the shared temp `v`, for scope variable `scope`.
+  // The first segment reads straight off the scope: scopes are null-prototype
+  // objects chained by prototype, so a missing name already reads as
+  // undefined — the `in` check did the same walk twice.
   function lookupCode(path, scope) {
-    let c = `if(${JSON.stringify(path[0])} in ${scope}){v=${scope}[${JSON.stringify(path[0])}];`;
+    let c = `v=${scope}[${JSON.stringify(path[0])}];\n`;
     for (let k = 1; k < path.length; k++) {
       c += `if(v!==null&&typeof v==='object'&&Object.hasOwn(v,${JSON.stringify(path[k])})){v=v[${JSON.stringify(path[k])}];}else{v=undefined;}`;
     }
-    c += '}else{v=undefined;}\n';
     return c;
   }
   gen(nodes, 'S');
@@ -862,7 +888,7 @@ function build(input) {
   {
     const files = [...b.input.files].sort((x, y) => byCodeUnits(x.path, y.path));
     for (const f of files) {
-      if (f.path.endsWith('.md')) b.sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+      if (f.path.endsWith('.md')) b.sources.push({ path: f.path, text: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n') });
       else b.statics.push({ path: f.path, content: f.content });
     }
   }
@@ -1000,12 +1026,14 @@ function build(input) {
     }
     return c;
   };
-  // A page as its layout reads it.
+  // A page as its layout reads it. The table of contents is shared as-is:
+  // its entries already have exactly the shape templates read, and templates
+  // never mutate them.
   const pageOf = (s) => ({
     ...cardOf(s),
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
