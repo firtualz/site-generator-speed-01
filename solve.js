@@ -39,15 +39,18 @@ function isWSCode(c) {
   );
 }
 
-/** The words of a body: its runs of characters other than whitespace. */
+/** The words of a body: its runs of characters other than whitespace.
+ *  The separator set is exactly JS \s (the baseline's /\S+/g): in ASCII
+ *  only 9-13 and 32 — NOT every code <= 32 (control codes 0-8 and 14-31
+ *  are word characters here). Micro-bench on practice bodies: this
+ *  comparison form is as fast as the old `c <= 32` (20.9 vs 22.0 ms) and
+ *  faster than a Uint8Array table (24.4 ms). */
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    // ASCII whitespace is all <= 32; only a code above 127 can be one of the
-    // other JS \s characters, so the common case is one comparison.
-    const ws = c <= 32 || (c > 127 && isWSCode(c));
+    const ws = c === 32 || (c >= 9 && c <= 13) || (c > 127 && isWSCode(c));
     if (ws) inWord = false;
     else if (!inWord) {
       inWord = true;
@@ -252,9 +255,8 @@ export function parseFrontMatter(text) {
 const ESC = new Uint8Array(128);
 for (const c of [92, 96, 42, 95, 91, 93, 40, 41, 35, 43, 45, 46, 33, 62]) ESC[c] = 1;
 
-/** Char codes that stop a plain run in inline(): one table lookup replaces nine comparisons. Codes above 127 read as undefined (falsy), and no special is above 127. */
-const SP = new Uint8Array(128);
-for (const c of [92, 96, 42, 91, 38, 60, 62, 34, 39]) SP[c] = 1;
+/** The characters that stop a plain run in inline(): a regex exec scans them in C++ (micro-bench on practice paragraphs: 11.5 vs 14.7 ms, 25/25). lastIndex is reset before every exec, so recursion is safe. */
+const SP_RE = /[\\`*\[&<>"']/g;
 
 function isEscapable(code) {
   return code < 128 && ESC[code] === 1;
@@ -326,8 +328,9 @@ function inline(s, linkFn) {
   let i = 0;
   const n = s.length;
   while (i < n) {
-    let j = i;
-    while (j < n && !SP[s.charCodeAt(j)]) j++;
+    SP_RE.lastIndex = i;
+    const mm = SP_RE.exec(s);
+    const j = mm === null ? n : mm.index;
     if (j > i) out += s.slice(i, j);
     if (j >= n) break;
     const c = s.charCodeAt(j);
@@ -782,7 +785,7 @@ function compileNodes(nodes) {
         code += 'o+=' + JSON.stringify(n.text) + ';\n';
       } else if (n.kind === 'var' || n.kind === 'raw') {
         code += lookupCode(n.path, scope);
-        code += n.kind === 'var' ? 'o+=esc(tx(v));\n' : 'o+=tx(v);\n';
+        code += n.kind === 'var' ? 'o+=etx(v);\n' : 'o+=tx(v);\n';
       } else if (n.kind === 'if') {
         code += lookupCode(n.path, scope);
         code += n.not ? 'if(ty(v)===false){\n' : 'if(ty(v)){\n';
@@ -800,11 +803,11 @@ function compileNodes(nodes) {
         const k = 'k' + id;
         const sc = 's' + id;
         code += lookupCode(n.path, scope);
-        code += `if(Array.isArray(v)){const ${xs}=v;for(let ${k}=0;${k}<${xs}.length;${k}++){const ${sc}=Object.create(${scope});${sc}[${JSON.stringify(n.name)}]=${xs}[${k}];${sc}.loop={index:${k}+1,first:${k}===0,last:${k}===${xs}.length-1,length:${xs}.length};\n`;
+        code += `if(Array.isArray(v)){const ${xs}=v;const ${sc}=Object.create(${scope});const ${sc}L={index:0,first:false,last:false,length:${xs}.length};${sc}.loop=${sc}L;for(let ${k}=0;${k}<${xs}.length;${k}++){${sc}[${JSON.stringify(n.name)}]=${xs}[${k}];${sc}L.index=${k}+1;${sc}L.first=${k}===0;${sc}L.last=${k}===${xs}.length-1;\n`;
         gen(n.body, sc);
         code += '}}\n';
       } else if (n.kind === 'include') {
-        code += `if(D<${INCLUDE_DEPTH}){const t=T.get(${JSON.stringify(n.name)});if(t!==undefined)o+=t(${scope},T,D+1,esc,tx,ty);}\n`;
+        code += `if(D<${INCLUDE_DEPTH}){const t=T.get(${JSON.stringify(n.name)});if(t!==undefined)o+=t(${scope},T,D+1,esc,tx,ty,etx);}\n`;
       }
     }
   };
@@ -827,7 +830,7 @@ function compileNodes(nodes) {
 export function compileTemplate(name, src) {
   const nodes = parseTemplate(name, src);
   const body = 'let o=\'\';\nlet v;\n' + compileNodes(nodes) + 'return o;';
-  return new Function('S', 'T', 'D', 'esc', 'tx', 'ty', body);
+  return new Function('S', 'T', 'D', 'esc', 'tx', 'ty', 'etx', body);
 }
 
 // -------------------------------------------------------------------- build
@@ -859,6 +862,7 @@ const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/'
 /** One site's output tree: path -> text. */
 function build(input) {
   const slugCache = new Map();
+  const etx = (v) => escapeHtml(typeof v === 'string' ? v : textOf(v));
   const templates = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
@@ -1053,7 +1057,7 @@ function build(input) {
       scope.tags = allTags;
       scope.recent = recent;
       Object.assign(scope, vars);
-      return fn(scope, b.templates, 0, escapeHtml, textOf, truthy);
+      return fn(scope, b.templates, 0, escapeHtml, textOf, truthy, etx);
     };
     for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
     const per = b.input.site.per_page;
