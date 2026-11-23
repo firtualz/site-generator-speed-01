@@ -1,3 +1,10 @@
+// V8 flag tune (allowed by the competition rules: "an entry may tune V8's
+// flags the same way" as main.ts's --no-incremental-marking). Measured: the
+// optimizing compiler costs ~100 ms of CPU in a fresh process and buys nothing
+// for this workload (steady-state speed is identical with --no-opt).
+import { setFlagsFromString } from 'node:v8';
+setFlagsFromString('--no-opt');
+
 // solve.js — a faster drop-in for makefun-site 1.0.0 (site-generator-speed-01).
 // Written from scratch against the makefun-site README + baseline code (the
 // reference). No dependencies. Deterministic: no clock, randomness, env or
@@ -25,6 +32,7 @@ ENT[39] = '&#39;';
 const ESC_TEST = /[&<>"']/;
 const ESC_RE = /[&<>"']/g;
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_FN = (c) => ESC_MAP[c];
 export function escapeHtml(text) {
   if (!ESC_TEST.test(text)) return text;
   return text.replace(ESC_RE, (c) => ESC_MAP[c]);
@@ -78,19 +86,23 @@ function slugifyRaw(text) {
   }
   if (!ascii) plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
-  let gap = false;
-  for (let i = 0; i < plain.length; i++) {
-    const code = plain.charCodeAt(i);
-    let keep = -1;
-    if (code >= 65 && code <= 90) keep = code + 32;
-    else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) keep = code;
-    if (keep === -1) {
-      gap = out.length > 0;
-      continue;
+  if (ascii) {
+    out = plain.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  } else {
+    let gap = false;
+    for (let i = 0; i < plain.length; i++) {
+      const code = plain.charCodeAt(i);
+      let keep = -1;
+      if (code >= 65 && code <= 90) keep = code + 32;
+      else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) keep = code;
+      if (keep === -1) {
+        gap = out.length > 0;
+        continue;
+      }
+      if (gap) out += '-';
+      gap = false;
+      out += String.fromCharCode(keep);
     }
-    if (gap) out += '-';
-    gap = false;
-    out += String.fromCharCode(keep);
   }
   out = out.slice(0, SLUG_MAX);
   let end = out.length;
@@ -324,66 +336,66 @@ function hasWS(s) {
 /** `s` rendered inline; `linkFn(target)` resolves a link's href. Single pass:
  *  plain runs are copied whole, specials are handled at their position. */
 function inline(s, linkFn) {
-  let out = '';
+  const P = [];
   let i = 0;
   const n = s.length;
   while (i < n) {
     SP_RE.lastIndex = i;
     const mm = SP_RE.exec(s);
     const j = mm === null ? n : mm.index;
-    if (j > i) out += s.slice(i, j);
+    if (j > i) P.push(s.slice(i, j));
     if (j >= n) break;
     const c = s.charCodeAt(j);
     if (c === 38) {
-      out += '&amp;';
+      P.push('&amp;');
       i = j + 1;
     } else if (c === 60) {
-      out += '&lt;';
+      P.push('&lt;');
       i = j + 1;
     } else if (c === 62) {
-      out += '&gt;';
+      P.push('&gt;');
       i = j + 1;
     } else if (c === 34) {
-      out += '&quot;';
+      P.push('&quot;');
       i = j + 1;
     } else if (c === 39) {
-      out += '&#39;';
+      P.push('&#39;');
       i = j + 1;
     } else if (c === 92) {
       if (j + 1 < n && isEscapable(s.charCodeAt(j + 1))) {
         const nc = s.charCodeAt(j + 1);
-        out += nc === 62 ? '&gt;' : s[j + 1];
+        P.push(nc === 62 ? '&gt;' : s[j + 1]);
         i = j + 2;
       } else {
-        out += '\\';
+        P.push('\\');
         i = j + 1;
       }
     } else if (c === 96) {
       const k = s.indexOf('`', j + 1);
       if (k > j + 1) {
-        out += '<code>' + escapeHtml(s.slice(j + 1, k)) + '</code>';
+        P.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
         i = k + 1;
       } else {
-        out += '`';
+        P.push('`');
         i = j + 1;
       }
     } else if (c === 42) {
       if (s.charCodeAt(j + 1) === 42) {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
-          out += '<strong>' + inline(s.slice(j + 2, k), linkFn) + '</strong>';
+          P.push('<strong>', inline(s.slice(j + 2, k), linkFn), '</strong>');
           i = k + 2;
         } else {
-          out += '**';
+          P.push('**');
           i = j + 2;
         }
       } else {
         const k = findSingleStar(s, j + 1);
         if (k > j + 1) {
-          out += '<em>' + inline(s.slice(j + 1, k), linkFn) + '</em>';
+          P.push('<em>', inline(s.slice(j + 1, k), linkFn), '</em>');
           i = k + 1;
         } else {
-          out += '*';
+          P.push('*');
           i = j + 1;
         }
       }
@@ -393,15 +405,15 @@ function inline(s, linkFn) {
       const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
       if (target !== '' && !hasWS(target)) {
-        out += '<a href="' + escapeHtml(linkFn(target)) + '">' + inline(s.slice(j + 1, k), linkFn) + '</a>';
+        P.push('<a href="', escapeHtml(linkFn(target)), '">', inline(s.slice(j + 1, k), linkFn), '</a>');
         i = m + 1;
       } else {
-        out += '[';
+        P.push('[');
         i = j + 1;
       }
     }
   }
-  return out;
+  return P.join('');
 }
 
 // Line helpers over `src` (a line is [ls, le), le at '\n' or end).
@@ -519,7 +531,7 @@ export function renderMarkdown(src, linkFn, slugCache) {
   const ids = new Set();
   const toc = [];
   let excerpt = null;
-  let out = '';
+  const OP = [];
   let i = 0;
   while (i < n) {
     const nl = src.indexOf('\n', i);
@@ -539,7 +551,7 @@ export function renderMarkdown(src, linkFn, slugCache) {
     }
     const lang = c0 === 96 ? fenceOpen(src, i, le) : null;
     if (lang !== null) {
-      let body = '';
+      const BP = [];
       let closed = false;
       i = next;
       while (i < n) {
@@ -551,13 +563,13 @@ export function renderMarkdown(src, linkFn, slugCache) {
           closed = true;
           break;
         }
-        body += escapeHtml(src.slice(i, le2)) + '\n';
+        BP.push(escapeHtml(src.slice(i, le2)), '\n');
         i = next2;
       }
       // A fence running to the end of input also takes the empty line after
       // a trailing newline (split('\n') yields it as a final empty line).
-      if (!closed && n > 0 && src.charCodeAt(n - 1) === 10) body += '\n';
-      out += '<pre><code' + (lang === '' ? '' : ' class="language-' + escapeHtml(lang) + '"') + '>' + body + '</code></pre>\n';
+      if (!closed && n > 0 && src.charCodeAt(n - 1) === 10) BP.push('\n');
+      OP.push('<pre><code' + (lang === '' ? '' : ' class="language-' + escapeHtml(lang) + '"') + '>' + BP.join('') + '</code></pre>\n');
       continue;
     }
     const h = c0 === 35 ? headingAt(src, i, le) : null;
@@ -565,13 +577,13 @@ export function renderMarkdown(src, linkFn, slugCache) {
       const text = src.slice(h.ts, h.te);
       const id = uniqueSlug(slugify(text, slugCache), ids);
       const html = inline(text, linkFn);
-      out += `<h${h.depth} id="${id}">${html}</h${h.depth}>\n`;
+      OP.push(`<h${h.depth} id="${id}">${html}</h${h.depth}>\n`);
       if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
       i = next;
       continue;
     }
     if ((c0 === 45 || c0 === 42) && hrAt(src, i, le)) {
-      out += '<hr>\n';
+      OP.push('<hr>\n');
       i = next;
       continue;
     }
@@ -588,7 +600,7 @@ export function renderMarkdown(src, linkFn, slugCache) {
         if (t !== '') lines.push(t);
         i = next2;
       }
-      out += lines.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(lines.join('\n'), linkFn)}</p>\n</blockquote>\n`;
+      OP.push(lines.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(lines.join('\n'), linkFn)}</p>\n</blockquote>\n`);
       continue;
     }
     const bRest = (c0 === 45 || c0 === 42) ? bulletAt(src, i, le) : -1;
@@ -620,9 +632,9 @@ export function renderMarkdown(src, linkFn, slugCache) {
       }
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`;
-      let inner = '';
-      for (const parts of items) inner += `<li>${inline(parts.join('\n'), linkFn)}</li>\n`;
-      out += `${open}\n${inner}</${tag}>\n`;
+      const IP = [];
+      for (const parts of items) IP.push(`<li>${inline(parts.join('\n'), linkFn)}</li>\n`);
+      OP.push(`${open}\n${IP.join('')}</${tag}>\n`);
       continue;
     }
     // Paragraph: lines up to a blank line, a fence, a heading or a break.
@@ -645,9 +657,9 @@ export function renderMarkdown(src, linkFn, slugCache) {
     }
     const html = inline(parts.join('\n'), linkFn);
     if (excerpt === null) excerpt = html;
-    out += `<p>${html}</p>\n`;
+    OP.push(`<p>${html}</p>\n`);
   }
-  return { html: out, toc, excerpt: excerpt ?? '' };
+  return { html: OP.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // --------------------------------------------------------------- templates
@@ -762,6 +774,49 @@ function textOf(v) {
   return '';
 }
 
+/** Shared emit helper: resolve `S.a.b` (first segment through the scope chain,
+ * later segments own-only) and return it escaped (raw=0) or as text (raw=1).
+ * One small function, called ~110k times per round, so it optimizes early and
+ * the generated template code stays tiny. */
+function em1(S, a, raw) {
+  const v = S[a];
+  return raw ? textOf(v) : ((typeof v === 'string' ? (ESC_TEST.test(v) ? v.replace(ESC_RE, ESC_FN) : v) : escapeHtml(textOf(v))));
+}
+function em2(S, a, b, raw) {
+  let v = S[a];
+  if (v !== null && typeof v === 'object' && Object.hasOwn(v, b)) v = v[b];
+  else v = undefined;
+  return raw ? textOf(v) : ((typeof v === 'string' ? (ESC_TEST.test(v) ? v.replace(ESC_RE, ESC_FN) : v) : escapeHtml(textOf(v))));
+}
+function em3(S, a, b, c, raw) {
+  let v = S[a];
+  if (v !== null && typeof v === 'object' && Object.hasOwn(v, b)) v = v[b];
+  else v = undefined;
+  if (v !== null && typeof v === 'object' && Object.hasOwn(v, c)) v = v[c];
+  else v = undefined;
+  return raw ? textOf(v) : ((typeof v === 'string' ? (ESC_TEST.test(v) ? v.replace(ESC_RE, ESC_FN) : v) : escapeHtml(textOf(v))));
+}
+
+/** Lookup-only helpers (same resolution as em*, without the escape): for
+ * if-conditions and for-iterables, which are evaluated once per block. */
+function lk1(S, a) {
+  return S[a];
+}
+function lk2(S, a, b) {
+  let v = S[a];
+  if (v !== null && typeof v === 'object' && Object.hasOwn(v, b)) v = v[b];
+  else v = undefined;
+  return v;
+}
+function lk3(S, a, b, c) {
+  let v = S[a];
+  if (v !== null && typeof v === 'object' && Object.hasOwn(v, b)) v = v[b];
+  else v = undefined;
+  if (v !== null && typeof v === 'object' && Object.hasOwn(v, c)) v = v[c];
+  else v = undefined;
+  return v;
+}
+
 /** Whether a value counts as true in an if: not undefined, null, false, "", 0 or an empty array. */
 function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
@@ -780,14 +835,45 @@ function compileNodes(nodes) {
   let code = '';
   let uniq = 0;
   const gen = (ns, scope) => {
+    let pend = [];
+    const flushPend = () => {
+      if (pend.length) {
+        code += 'A.push(' + pend.join(',') + ');\n';
+        pend = [];
+      }
+    };
+    let pendText = '';
+    const flushText = () => {
+      if (pendText !== '') {
+        pend.push(JSON.stringify(pendText));
+        pendText = '';
+      }
+      flushPend();
+    };
     for (const n of ns) {
       if (n.kind === 'text') {
-        code += 'o+=' + JSON.stringify(n.text) + ';\n';
+        pendText += n.text;
       } else if (n.kind === 'var' || n.kind === 'raw') {
-        code += lookupCode(n.path, scope);
-        code += n.kind === 'var' ? 'o+=etx(v);\n' : 'o+=tx(v);\n';
+        const raw = n.kind === 'raw' ? 1 : 0;
+        const p = n.path;
+        let val;
+        if (p.length === 1) val = `E1(${scope},${JSON.stringify(p[0])},${raw})`;
+        else if (p.length === 2) val = `E2(${scope},${JSON.stringify(p[0])},${JSON.stringify(p[1])},${raw})`;
+        else if (p.length === 3) val = `E3(${scope},${JSON.stringify(p[0])},${JSON.stringify(p[1])},${JSON.stringify(p[2])},${raw})`;
+        else {
+          code += lookupCode(n.path, scope);
+          val = n.kind === 'var'
+            ? "(typeof v==='string'?(ET.test(v)?v.replace(ER,EF):v):etx(v))"
+            : "(typeof v==='string'?v:tx(v))";
+        }
+        if (pendText !== '') {
+          pend.push(JSON.stringify(pendText));
+          pendText = '';
+        }
+        pend.push(val);
       } else if (n.kind === 'if') {
-        code += lookupCode(n.path, scope);
+        flushText();
+        code += condCode(n.path, scope);
         code += n.not ? 'if(ty(v)===false){\n' : 'if(ty(v)){\n';
         gen(n.then, scope);
         code += '}';
@@ -798,23 +884,33 @@ function compileNodes(nodes) {
         }
         code += '\n';
       } else if (n.kind === 'for') {
+        flushText();
+        code += condCode(n.path, scope);
         const id = uniq++;
         const xs = 'x' + id;
         const k = 'k' + id;
         const sc = 's' + id;
-        code += lookupCode(n.path, scope);
         code += `if(Array.isArray(v)){const ${xs}=v;const ${sc}=Object.create(${scope});const ${sc}L={index:0,first:false,last:false,length:${xs}.length};${sc}.loop=${sc}L;for(let ${k}=0;${k}<${xs}.length;${k}++){${sc}[${JSON.stringify(n.name)}]=${xs}[${k}];${sc}L.index=${k}+1;${sc}L.first=${k}===0;${sc}L.last=${k}===${xs}.length-1;\n`;
         gen(n.body, sc);
         code += '}}\n';
       } else if (n.kind === 'include') {
-        code += `if(D<${INCLUDE_DEPTH}){const t=T.get(${JSON.stringify(n.name)});if(t!==undefined)o+=t(${scope},T,D+1,esc,tx,ty,etx);}\n`;
+        flushText();
+        code += `if(D<${INCLUDE_DEPTH}){const t=T.get(${JSON.stringify(n.name)});if(t!==undefined)t(${scope},T,D+1,A,esc,tx,ty,etx,ET,ER,EF,E1,E2,E3,L1,L2,L3);}\n`;
       }
     }
+    flushText();
   };
   // Emit a path lookup into the shared temp `v`, for scope variable `scope`.
   // The first segment reads straight off the scope: scopes are null-prototype
   // objects chained by prototype, so a missing name already reads as
   // undefined — the `in` check did the same walk twice.
+  function condCode(path, scope) {
+    const p = path;
+    if (p.length === 1) return `v=L1(${scope},${JSON.stringify(p[0])});\n`;
+    if (p.length === 2) return `v=L2(${scope},${JSON.stringify(p[0])},${JSON.stringify(p[1])});\n`;
+    if (p.length === 3) return `v=L3(${scope},${JSON.stringify(p[0])},${JSON.stringify(p[1])},${JSON.stringify(p[2])});\n`;
+    return lookupCode(path, scope);
+  }
   function lookupCode(path, scope) {
     let c = `v=${scope}[${JSON.stringify(path[0])}];\n`;
     for (let k = 1; k < path.length; k++) {
@@ -829,8 +925,8 @@ function compileNodes(nodes) {
 /** Compile one template's source into its render function (a TemplateError when it does not parse). */
 export function compileTemplate(name, src) {
   const nodes = parseTemplate(name, src);
-  const body = 'let o=\'\';\nlet v;\n' + compileNodes(nodes) + 'return o;';
-  return new Function('S', 'T', 'D', 'esc', 'tx', 'ty', 'etx', body);
+  const body = 'let v;\n' + compileNodes(nodes);
+  return new Function('S', 'T', 'D', 'A', 'esc', 'tx', 'ty', 'etx', 'ET', 'ER', 'EF', 'E1', 'E2', 'E3', 'L1', 'L2', 'L3', body);
 }
 
 // -------------------------------------------------------------------- build
@@ -1057,7 +1153,9 @@ function build(input) {
       scope.tags = allTags;
       scope.recent = recent;
       Object.assign(scope, vars);
-      return fn(scope, b.templates, 0, escapeHtml, textOf, truthy, etx);
+      const A = [];
+      fn(scope, b.templates, 0, A, escapeHtml, textOf, truthy, etx, ESC_TEST, ESC_RE, ESC_FN, em1, em2, em3, lk1, lk2, lk3);
+      return A.join('');
     };
     for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
     const per = b.input.site.per_page;
